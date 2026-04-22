@@ -106,7 +106,10 @@ function Get-AllPages {
         if ($page.Count -lt $top) { break }
     } while ($true)
 
-    return $results
+    # , [object[]] prevents PowerShell from unrolling the list on return.
+    # Without this, a 1-item result comes back as a bare PSCustomObject with
+    # no .Count property, which throws under Set-StrictMode -Version Latest.
+    return , [object[]]$results
 }
 
 function ConvertTo-CsvSafe {
@@ -200,12 +203,12 @@ foreach ($project in $projects) {
         }
 
         # PR count — paginate to get the accurate total (response.count is only page count)
-        $prAll   = Get-AllPages -BaseUrl "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/pullrequests?api-version=7.1&searchCriteria.status=all" -Headers $headers
+        $prAll   = @(Get-AllPages -BaseUrl "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/pullrequests?api-version=7.1&searchCriteria.status=all" -Headers $headers)
         $prCount = $prAll.Count
 
         # Commits in the past year — used for both commits-past-year and most-active-contributor
         $yearAgo     = (Get-Date).AddYears(-1).ToString("yyyy-MM-dd")
-        $yearCommits = Get-AllPages -BaseUrl "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/commits?api-version=7.1&searchCriteria.fromDate=$yearAgo" -Headers $headers
+        $yearCommits = @(Get-AllPages -BaseUrl "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/commits?api-version=7.1&searchCriteria.fromDate=$yearAgo" -Headers $headers)
         $commitsPastYear = $yearCommits.Count
 
         $topContributor = ""
