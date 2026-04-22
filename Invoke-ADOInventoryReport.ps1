@@ -11,6 +11,11 @@
         pipelines.csv       - All pipelines in ado2gh format, with an extra
                               cross-project-repo column for cross-project refs
 
+    Optional switches let you control expensive repo metrics:
+        -Commit       Populate commits-past-year
+        -Pr           Populate pr-count
+        -Contributor  Populate most-active-contributor
+
 .PARAMETER AdoOrg
     Your Azure DevOps organization name (e.g. "rodesaro4")
 
@@ -21,12 +26,24 @@
 .PARAMETER OutputDir
     Directory to write the four CSV files. Defaults to current directory.
 
+.PARAMETER Commit
+    If specified, queries commit history and populates commits-past-year.
+
+.PARAMETER Pr
+    If specified, queries pull requests and populates pr-count.
+
+.PARAMETER Contributor
+    If specified, queries commit history and populates most-active-contributor.
+
 .EXAMPLE
     .\Invoke-ADOInventoryReport.ps1 -AdoOrg "rodesaro4" -AdoPat "xxxx"
 
 .EXAMPLE
+    .\Invoke-ADOInventoryReport.ps1 -AdoOrg "rodesaro4" -Commit -Pr -Contributor
+
+.EXAMPLE
     $env:ADO_PAT = "xxxx"
-    .\Invoke-ADOInventoryReport.ps1 -AdoOrg "rodesaro4" -OutputDir "C:\reports"
+    .\Invoke-ADOInventoryReport.ps1 -AdoOrg "rodesaro4" -OutputDir "C:\reports" -Pr
 #>
 
 [CmdletBinding()]
@@ -38,7 +55,16 @@ param (
     [string]$AdoPat = $env:ADO_PAT,
 
     [Parameter(Mandatory = $false)]
-    [string]$OutputDir = "."
+    [string]$OutputDir = ".",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$Commit,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$Pr,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$Contributor
 )
 
 Set-StrictMode -Version Latest
@@ -66,14 +92,14 @@ function Write-Log {
 function Get-AuthHeader {
     $token = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$AdoPat"))
     return @{
-        Authorization = "Basic $token"
+        Authorization  = "Basic $token"
         "Content-Type" = "application/json"
     }
 }
 
 function Get-ProjectSegment {
     param([string]$ProjectName)
-    return [Uri]::EscapeDataString($ProjectName)
+    return [System.Uri]::EscapeDataString($ProjectName)
 }
 
 function Invoke-AdoApi {
@@ -169,8 +195,6 @@ function Get-NestedStringValue {
         return ""
     }
 
-    # Handle ADO property-bag values like:
-    # { "$value": "something" } or { "value": "something" }
     if ($current -isnot [string]) {
         $dollarValue = Get-PropValue -Object $current -Name '$value'
         if ($null -ne $dollarValue) {
@@ -209,9 +233,7 @@ function Get-AllPages {
 
         $pageRaw = if ($response.PSObject.Properties[$ValueProperty]) { $response.$ValueProperty } else { $null }
         $page    = @(ConvertTo-ObjectArray $pageRaw)
-
-        # Avoid @($null).Count = 1 issue
-        $page = @($page | Where-Object { $null -ne $_ })
+        $page    = @($page | Where-Object { $null -ne $_ })
 
         if ($page.Count -eq 0) {
             break
@@ -240,7 +262,7 @@ function Get-CommitStatsPastYear {
         [hashtable]$Headers
     )
 
-    $repoIdEsc = [Uri]::EscapeDataString($RepoId)
+    $repoIdEsc = [System.Uri]::EscapeDataString($RepoId)
     $url = "$BaseUrl/$ProjectSegment/_apis/git/repositories/$repoIdEsc/commitsbatch?api-version=7.1"
 
     $fromDate = [DateTime]::UtcNow.AddYears(-1).ToString("o")
@@ -309,7 +331,7 @@ function Get-CommitStatsPastYear {
     }
 
     return @{
-        Count = $allCommits.Count
+        Count          = $allCommits.Count
         TopContributor = $topContributor
     }
 }
@@ -333,7 +355,6 @@ function Resolve-BuildRepository {
     $defRepo = Get-PropValue -Object $Definition -Name 'repository'
     $defId   = Get-PropValue -Object $Definition -Name 'id'
 
-    # Always fetch the full definition for stronger cross-project resolution.
     $fullDef = $null
     if ($defId) {
         $pipelineProjSeg = Get-ProjectSegment -ProjectName $PipelineProject
@@ -409,7 +430,6 @@ function Resolve-BuildRepository {
         }
     }
 
-    # If the repo name comes back as "Project/Repo", split it.
     if ($repoName -match '^([^/]+)/(.+)$') {
         $prefixProject = $Matches[1]
         $suffixRepo    = $Matches[2]
@@ -421,7 +441,6 @@ function Resolve-BuildRepository {
         $repoName = $suffixRepo
     }
 
-    # Strongest match: repo ID -> actual project/name from inventory
     if ($repoId -and $RepoIdToProject.ContainsKey($repoId)) {
         $repoProject = $RepoIdToProject[$repoId]
         if ($RepoIdToName.ContainsKey($repoId)) {
@@ -429,7 +448,6 @@ function Resolve-BuildRepository {
         }
     }
 
-    # Fallback to abbreviated repo info if still blank
     if (-not $repoName -and $defRepo) {
         $fallbackName = Get-NestedStringValue -Object $defRepo -Path @('name')
         if ($fallbackName) {
@@ -445,7 +463,6 @@ function Resolve-BuildRepository {
         }
     }
 
-    # Last-resort recovery using repo name against known repos
     if ($repoName) {
         $sameProjectKey = "$PipelineProject/$repoName"
         $sameProjectHit = $AllRepos | Where-Object { $_["_repoKey"] -eq $sameProjectKey } | Select-Object -First 1
@@ -536,6 +553,19 @@ $headers = Get-AuthHeader
 Write-Log "ADO ORG: $AdoOrg"
 Write-Log "Creating inventory report..."
 
+if ($Commit) {
+    Write-Log "Commit metric enabled: commits-past-year will be queried."
+}
+if ($Pr) {
+    Write-Log "PR metric enabled: pr-count will be queried."
+}
+if ($Contributor) {
+    Write-Log "Contributor metric enabled: most-active-contributor will be queried."
+}
+if (-not $Commit -and -not $Pr -and -not $Contributor) {
+    Write-Log "No optional repo metrics requested (-Commit/-Pr/-Contributor not specified). Expensive repo stats will be skipped."
+}
+
 # ---------------------------------------------------------------------------
 # 1. Fetch all team projects
 # ---------------------------------------------------------------------------
@@ -553,7 +583,7 @@ Write-Log "Finding Team Projects..."
 Write-Log "Found $($projects.Count) Team Projects"
 
 # ---------------------------------------------------------------------------
-# 2. Fetch repos per project + accurate stats
+# 2. Fetch repos per project + optional stats
 # ---------------------------------------------------------------------------
 
 Write-Log "Finding Repos..."
@@ -568,19 +598,18 @@ foreach ($project in $projects) {
     $repos = Get-AllPages -BaseUrl "$baseUrl/$projSeg/_apis/git/repositories?api-version=7.1" -Headers $headers
 
     foreach ($repo in $repos) {
-        $repoName = [string]$repo.name
-        $repoKey  = "$projName/$repoName"
-        $repoUrl  = [string]$repo.remoteUrl
+        $repoName  = [string]$repo.name
+        $repoKey   = "$projName/$repoName"
+        $repoUrl   = [string]$repo.remoteUrl
+        $repoId    = [string]$repo.id
+        $repoIdEsc = [System.Uri]::EscapeDataString($repoId)
 
-        # ADO repository size is returned in KB
         $sizeBytes = 0
         if ($repo.PSObject.Properties['size'] -and $repo.size) {
             $sizeBytes = [int64]$repo.size * 1KB
         }
 
-        # Last push date
         $lastPush = ""
-        $repoIdEsc = [Uri]::EscapeDataString([string]$repo.id)
         $pushesList = Invoke-AdoApi -Url "$baseUrl/$projSeg/_apis/git/repositories/$repoIdEsc/pushes?api-version=7.1&`$top=1" -Headers $headers
         if ($pushesList -and $pushesList.PSObject.Properties['value']) {
             $pushValues = @(ConvertTo-ObjectArray $pushesList.value)
@@ -589,23 +618,33 @@ foreach ($project in $projects) {
             }
         }
 
-        # Accurate PR count
-        $prAll = @(
-            Get-AllPages `
-                -BaseUrl "$baseUrl/$projSeg/_apis/git/repositories/$([Uri]::EscapeDataString([string]$repo.id))/pullrequests?api-version=7.1&searchCriteria.status=all" `
+        $prCount = ""
+        if ($Pr) {
+            $prAll = @(
+                Get-AllPages `
+                    -BaseUrl "$baseUrl/$projSeg/_apis/git/repositories/$repoIdEsc/pullrequests?api-version=7.1&searchCriteria.status=all" `
+                    -Headers $headers
+            )
+            $prCount = @($prAll | Where-Object { $null -ne $_ }).Count
+        }
+
+        $commitsPastYear = ""
+        $topContributor  = ""
+        if ($Commit -or $Contributor) {
+            $commitStats = Get-CommitStatsPastYear `
+                -BaseUrl $baseUrl `
+                -ProjectSegment $projSeg `
+                -RepoId $repoId `
                 -Headers $headers
-        )
-        $prCount = @($prAll | Where-Object { $null -ne $_ }).Count
 
-        # Accurate commits in past year + most active contributor
-        $commitStats = Get-CommitStatsPastYear `
-            -BaseUrl $baseUrl `
-            -ProjectSegment $projSeg `
-            -RepoId ([string]$repo.id) `
-            -Headers $headers
+            if ($Commit) {
+                $commitsPastYear = [int]$commitStats.Count
+            }
 
-        $commitsPastYear = [int]$commitStats.Count
-        $topContributor  = [string]$commitStats.TopContributor
+            if ($Contributor) {
+                $topContributor = [string]$commitStats.TopContributor
+            }
+        }
 
         $normalizedId = if ($repo.PSObject.Properties['id'] -and $repo.id) {
             ([string]$repo.id).ToLower()
@@ -667,14 +706,7 @@ foreach ($project in $projects) {
         $pipelineId   = [string]$def.id
         $pipelineUrl  = "$baseUrl/$projSeg/_build/definition?definitionId=$pipelineId"
 
-        $resolved = Resolve-BuildRepository `
-            -PipelineProject $projName `
-            -Definition $def `
-            -BaseUrl $baseUrl `
-            -Headers $headers `
-            -RepoIdToProject $repoIdToProject `
-            -RepoIdToName $repoIdToName `
-            -AllRepos @($allRepos)
+        $resolved = Resolve-BuildRepository -PipelineProject $projName -Definition $def -BaseUrl $baseUrl -Headers $headers -RepoIdToProject $repoIdToProject -RepoIdToName $repoIdToName -AllRepos @($allRepos)
 
         $repoProject      = $resolved.RepoProject
         $repoName         = $resolved.RepoName
@@ -718,6 +750,13 @@ foreach ($repo in $allRepos) {
 # 5. Write CSVs
 # ---------------------------------------------------------------------------
 
+$orgPrTotal = ""
+if ($Pr) {
+    $orgPrTotal = ($allRepos | ForEach-Object {
+        if ([string]::IsNullOrWhiteSpace([string]$_["pr-count"])) { 0 } else { [int]$_["pr-count"] }
+    } | Measure-Object -Sum).Sum
+}
+
 # -- orgs.csv --
 $orgRow = @{
     "name"              = $AdoOrg
@@ -727,7 +766,7 @@ $orgRow = @{
     "repo-count"        = $allRepos.Count
     "pipeline-count"    = $allPipelines.Count
     "is-pat-org-admin"  = "unknown"
-    "pr-count"          = ($allRepos | ForEach-Object { [int]$_["pr-count"] } | Measure-Object -Sum).Sum
+    "pr-count"          = $orgPrTotal
 }
 
 Write-Log "Generating orgs.csv..."
@@ -743,7 +782,13 @@ $teamProjectRows = @(
         $projName  = [string]$project.name
         $projRepos = @($allRepos     | Where-Object { $_["_projName"]   -eq $projName })
         $projPipes = @($allPipelines | Where-Object { $_["teamproject"] -eq $projName })
-        $projPRs   = ($projRepos | ForEach-Object { [int]$_["pr-count"] } | Measure-Object -Sum).Sum
+
+        $projPRs = ""
+        if ($Pr) {
+            $projPRs = ($projRepos | ForEach-Object {
+                if ([string]::IsNullOrWhiteSpace([string]$_["pr-count"])) { 0 } else { [int]$_["pr-count"] }
+            } | Measure-Object -Sum).Sum
+        }
 
         @{
             "org"            = $AdoOrg
