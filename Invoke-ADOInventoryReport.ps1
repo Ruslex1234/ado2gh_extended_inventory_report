@@ -49,18 +49,31 @@ $ErrorActionPreference = "Stop"
 # ---------------------------------------------------------------------------
 
 function Write-Log {
-    param([string]$Message, [switch]$Success)
+    param(
+        [string]$Message,
+        [switch]$Success
+    )
+
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     if ($Success) {
         Write-Host "[$ts] [INFO] $Message" -ForegroundColor Green
-    } else {
+    }
+    else {
         Write-Host "[$ts] [INFO] $Message"
     }
 }
 
 function Get-AuthHeader {
     $token = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$AdoPat"))
-    return @{ Authorization = "Basic $token"; "Content-Type" = "application/json" }
+    return @{
+        Authorization = "Basic $token"
+        "Content-Type" = "application/json"
+    }
+}
+
+function Get-ProjectSegment {
+    param([string]$ProjectName)
+    return [Uri]::EscapeDataString($ProjectName)
 }
 
 function Invoke-AdoApi {
@@ -68,9 +81,9 @@ function Invoke-AdoApi {
         [string]$Url,
         [hashtable]$Headers = (Get-AuthHeader)
     )
+
     try {
-        $response = Invoke-RestMethod -Uri $Url -Headers $Headers -Method Get
-        return $response
+        return Invoke-RestMethod -Uri $Url -Headers $Headers -Method Get
     }
     catch {
         Write-Warning "API call failed: $Url`n$($_.Exception.Message)"
@@ -78,47 +91,407 @@ function Invoke-AdoApi {
     }
 }
 
+function Invoke-AdoApiPostJson {
+    param (
+        [string]$Url,
+        [object]$Body,
+        [hashtable]$Headers = (Get-AuthHeader)
+    )
+
+    try {
+        $json = $Body | ConvertTo-Json -Depth 20
+        return Invoke-RestMethod -Uri $Url -Headers $Headers -Method Post -Body $json -ContentType "application/json"
+    }
+    catch {
+        Write-Warning "API POST failed: $Url`n$($_.Exception.Message)"
+        return $null
+    }
+}
+
+function ConvertTo-ObjectArray {
+    param($InputObject)
+
+    if ($null -eq $InputObject) {
+        return @()
+    }
+
+    if ($InputObject -is [System.Array]) {
+        return @($InputObject)
+    }
+
+    if ($InputObject -is [System.Collections.IList]) {
+        return @($InputObject)
+    }
+
+    return @($InputObject)
+}
+
+function Get-PropValue {
+    param(
+        $Object,
+        [string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+
+    if ($Object -is [hashtable]) {
+        if ($Object.ContainsKey($Name)) {
+            return $Object[$Name]
+        }
+        return $null
+    }
+
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($prop) {
+        return $prop.Value
+    }
+
+    return $null
+}
+
+function Get-NestedStringValue {
+    param(
+        $Object,
+        [string[]]$Path
+    )
+
+    $current = $Object
+    foreach ($part in $Path) {
+        if ($null -eq $current) {
+            return ""
+        }
+        $current = Get-PropValue -Object $current -Name $part
+    }
+
+    if ($null -eq $current) {
+        return ""
+    }
+
+    # Handle ADO property-bag values like:
+    # { "$value": "something" } or { "value": "something" }
+    if ($current -isnot [string]) {
+        $dollarValue = Get-PropValue -Object $current -Name '$value'
+        if ($null -ne $dollarValue) {
+            return [string]$dollarValue
+        }
+
+        $plainValue = Get-PropValue -Object $current -Name 'value'
+        if ($null -ne $plainValue) {
+            return [string]$plainValue
+        }
+    }
+
+    return [string]$current
+}
+
 function Get-AllPages {
     param (
         [string]$BaseUrl,
         [hashtable]$Headers = (Get-AuthHeader),
-        [string]$ValueProperty = "value"
+        [string]$ValueProperty = "value",
+        [string]$TopParameter = '$top',
+        [string]$SkipParameter = '$skip'
     )
+
     $results   = [System.Collections.Generic.List[object]]::new()
     $separator = if ($BaseUrl -match "\?") { "&" } else { "?" }
     $top  = 200
     $skip = 0
 
     do {
-        $url      = "${BaseUrl}${separator}`$top=${top}&`$skip=${skip}"
+        $url = "{0}{1}{2}={3}&{4}={5}" -f $BaseUrl, $separator, $TopParameter, $top, $SkipParameter, $skip
         $response = Invoke-AdoApi -Url $url -Headers $Headers
-        if ($null -eq $response) { break }
+        if ($null -eq $response) {
+            break
+        }
 
-        # @() wrapping guarantees an array with a valid .Count in strict mode,
-        # even when a single-item ADO response deserialises as a bare PSCustomObject.
         $pageRaw = if ($response.PSObject.Properties[$ValueProperty]) { $response.$ValueProperty } else { $null }
-        $page    = @($pageRaw)
-        if ($page.Count -eq 0) { break }
+        $page    = @(ConvertTo-ObjectArray $pageRaw)
 
-        $results.AddRange($page)
+        # Avoid @($null).Count = 1 issue
+        $page = @($page | Where-Object { $null -ne $_ })
+
+        if ($page.Count -eq 0) {
+            break
+        }
+
+        foreach ($item in $page) {
+            [void]$results.Add($item)
+        }
+
         $skip += $page.Count
 
-        if ($page.Count -lt $top) { break }
-    } while ($true)
+        if ($page.Count -lt $top) {
+            break
+        }
+    }
+    while ($true)
 
-    # , [object[]] prevents PowerShell from unrolling the list on return.
-    # Without this, a 1-item result comes back as a bare PSCustomObject with
-    # no .Count property, which throws under Set-StrictMode -Version Latest.
-    return , [object[]]$results
+    return ,([object[]]$results)
+}
+
+function Get-CommitStatsPastYear {
+    param(
+        [string]$BaseUrl,
+        [string]$ProjectSegment,
+        [string]$RepoId,
+        [hashtable]$Headers
+    )
+
+    $repoIdEsc = [Uri]::EscapeDataString($RepoId)
+    $url = "$BaseUrl/$ProjectSegment/_apis/git/repositories/$repoIdEsc/commitsbatch?api-version=7.1"
+
+    $fromDate = [DateTime]::UtcNow.AddYears(-1).ToString("o")
+    $skip = 0
+    $top  = 200
+
+    $allCommits = [System.Collections.Generic.List[object]]::new()
+
+    do {
+        $body = @{
+            searchCriteria = @{
+                fromDate = $fromDate
+                '$top'   = $top
+                '$skip'  = $skip
+            }
+        }
+
+        $response = Invoke-AdoApiPostJson -Url $url -Body $body -Headers $Headers
+        if ($null -eq $response) {
+            break
+        }
+
+        $page = @()
+        if ($response.PSObject.Properties['value']) {
+            $page = @(ConvertTo-ObjectArray $response.value | Where-Object { $null -ne $_ })
+        }
+
+        if ($page.Count -eq 0) {
+            break
+        }
+
+        foreach ($commit in $page) {
+            [void]$allCommits.Add($commit)
+        }
+
+        $skip += $page.Count
+
+        if ($page.Count -lt $top) {
+            break
+        }
+    }
+    while ($true)
+
+    $topContributor = ""
+    if ($allCommits.Count -gt 0) {
+        $top1 = $allCommits |
+            Where-Object { $_.PSObject.Properties['author'] -and $_.author } |
+            Group-Object {
+                if ($_.author.PSObject.Properties['name'] -and $_.author.name) {
+                    [string]$_.author.name
+                }
+                elseif ($_.author.PSObject.Properties['email'] -and $_.author.email) {
+                    [string]$_.author.email
+                }
+                else {
+                    "__blank__"
+                }
+            } |
+            Where-Object { $_.Name -ne "__blank__" } |
+            Sort-Object -Property @{ Expression = 'Count'; Descending = $true }, @{ Expression = 'Name'; Descending = $false } |
+            Select-Object -First 1
+
+        if ($top1) {
+            $topContributor = $top1.Name
+        }
+    }
+
+    return @{
+        Count = $allCommits.Count
+        TopContributor = $topContributor
+    }
+}
+
+function Resolve-BuildRepository {
+    param(
+        [string]$PipelineProject,
+        $Definition,
+        [string]$BaseUrl,
+        [hashtable]$Headers,
+        [hashtable]$RepoIdToProject,
+        [hashtable]$RepoIdToName,
+        [object[]]$AllRepos
+    )
+
+    $repoType    = ""
+    $repoProject = $PipelineProject
+    $repoName    = ""
+    $repoId      = ""
+
+    $defRepo = Get-PropValue -Object $Definition -Name 'repository'
+    $defId   = Get-PropValue -Object $Definition -Name 'id'
+
+    # Always fetch the full definition for stronger cross-project resolution.
+    $fullDef = $null
+    if ($defId) {
+        $pipelineProjSeg = Get-ProjectSegment -ProjectName $PipelineProject
+        $fullDef = Invoke-AdoApi -Url "$BaseUrl/$pipelineProjSeg/_apis/build/definitions/${defId}?api-version=7.1" -Headers $Headers
+    }
+
+    $candidateRepos = @()
+    if ($defRepo) {
+        $candidateRepos += $defRepo
+    }
+
+    $fullRepo = Get-PropValue -Object $fullDef -Name 'repository'
+    if ($fullRepo) {
+        $candidateRepos += $fullRepo
+    }
+
+    foreach ($repo in $candidateRepos) {
+        if (-not $repo) {
+            continue
+        }
+
+        if (-not $repoType) {
+            $v = Get-NestedStringValue -Object $repo -Path @('type')
+            if ($v) {
+                $repoType = $v
+            }
+        }
+
+        if (-not $repoId) {
+            $v = Get-NestedStringValue -Object $repo -Path @('id')
+            if ($v) {
+                $repoId = $v.ToLower()
+            }
+        }
+
+        if (-not $repoName) {
+            $v = Get-NestedStringValue -Object $repo -Path @('name')
+            if ($v) {
+                $repoName = $v
+            }
+        }
+
+        $projectName = Get-NestedStringValue -Object $repo -Path @('project', 'name')
+        if ($projectName) {
+            $repoProject = $projectName
+        }
+
+        if (-not $repoName) {
+            foreach ($path in @(
+                @('properties', 'fullName'),
+                @('properties', 'repositoryName'),
+                @('properties', 'name')
+            )) {
+                $v = Get-NestedStringValue -Object $repo -Path $path
+                if ($v) {
+                    $repoName = $v
+                    break
+                }
+            }
+        }
+
+        if (-not $repoProject -or $repoProject -eq $PipelineProject) {
+            foreach ($path in @(
+                @('properties', 'projectName'),
+                @('properties', 'teamProject')
+            )) {
+                $v = Get-NestedStringValue -Object $repo -Path $path
+                if ($v) {
+                    $repoProject = $v
+                    break
+                }
+            }
+        }
+    }
+
+    # If the repo name comes back as "Project/Repo", split it.
+    if ($repoName -match '^([^/]+)/(.+)$') {
+        $prefixProject = $Matches[1]
+        $suffixRepo    = $Matches[2]
+
+        if (-not $repoProject -or $repoProject -eq $PipelineProject) {
+            $repoProject = $prefixProject
+        }
+
+        $repoName = $suffixRepo
+    }
+
+    # Strongest match: repo ID -> actual project/name from inventory
+    if ($repoId -and $RepoIdToProject.ContainsKey($repoId)) {
+        $repoProject = $RepoIdToProject[$repoId]
+        if ($RepoIdToName.ContainsKey($repoId)) {
+            $repoName = $RepoIdToName[$repoId]
+        }
+    }
+
+    # Fallback to abbreviated repo info if still blank
+    if (-not $repoName -and $defRepo) {
+        $fallbackName = Get-NestedStringValue -Object $defRepo -Path @('name')
+        if ($fallbackName) {
+            if ($fallbackName -match '^([^/]+)/(.+)$') {
+                if (-not $repoProject -or $repoProject -eq $PipelineProject) {
+                    $repoProject = $Matches[1]
+                }
+                $repoName = $Matches[2]
+            }
+            else {
+                $repoName = $fallbackName
+            }
+        }
+    }
+
+    # Last-resort recovery using repo name against known repos
+    if ($repoName) {
+        $sameProjectKey = "$PipelineProject/$repoName"
+        $sameProjectHit = $AllRepos | Where-Object { $_["_repoKey"] -eq $sameProjectKey } | Select-Object -First 1
+
+        if ($sameProjectHit) {
+            $repoProject = $sameProjectHit["_projName"]
+            $repoName    = $sameProjectHit["repo"]
+        }
+        else {
+            $globalHit = $AllRepos | Where-Object { $_["repo"] -eq $repoName } | Select-Object -First 1
+            if ($globalHit) {
+                if (-not $repoProject) {
+                    $repoProject = $globalHit["_projName"]
+                }
+                $repoName = $globalHit["repo"]
+            }
+        }
+    }
+
+    if (-not $repoProject) {
+        $repoProject = $PipelineProject
+    }
+
+    $isCrossProject = ($repoType -eq "TfsGit") -and (-not [string]::IsNullOrWhiteSpace($repoName)) -and ($repoProject -ne $PipelineProject)
+    $crossProjectRepo = if ($isCrossProject) { "$repoProject/$repoName" } else { "" }
+
+    return @{
+        RepoType         = $repoType
+        RepoProject      = $repoProject
+        RepoName         = $repoName
+        CrossProjectRepo = $crossProjectRepo
+    }
 }
 
 function ConvertTo-CsvSafe {
     param([string]$Value)
-    if ($null -eq $Value) { return "" }
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
     $v = $Value.ToString().Trim()
     if ($v -match '[,"\r\n]') {
         $v = '"' + $v.Replace('"', '""') + '"'
     }
+
     return $v
 }
 
@@ -128,14 +501,17 @@ function Write-Csv {
         [string[]]$Headers,
         [object[]]$Rows
     )
+
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add($Headers -join ",")
+
     foreach ($row in $Rows) {
         $cells = foreach ($h in $Headers) {
             ConvertTo-CsvSafe -Value $row[$h]
         }
         $lines.Add($cells -join ",")
     }
+
     $lines | Set-Content -Path $Path -Encoding UTF8
 }
 
@@ -147,8 +523,10 @@ if ([string]::IsNullOrWhiteSpace($AdoPat)) {
     throw "No PAT provided. Use -AdoPat or set the ADO_PAT environment variable."
 }
 
-$OutputDir = (Resolve-Path $OutputDir -ErrorAction SilentlyContinue)?.Path
-if (-not $OutputDir) {
+if (Test-Path -LiteralPath $OutputDir) {
+    $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
+}
+else {
     $OutputDir = (New-Item -ItemType Directory -Path $OutputDir -Force).FullName
 }
 
@@ -164,8 +542,12 @@ Write-Log "Creating inventory report..."
 
 Write-Log "Finding Orgs..."
 $projectsResponse = Invoke-AdoApi -Url "$baseUrl/_apis/projects?api-version=7.1&`$top=500" -Headers $headers
-if ($null -eq $projectsResponse) { throw "Failed to fetch projects from $baseUrl" }
+if ($null -eq $projectsResponse) {
+    throw "Failed to fetch projects from $baseUrl"
+}
+
 $projects = @($projectsResponse.value)
+
 Write-Log "Found 1 Orgs"
 Write-Log "Finding Team Projects..."
 Write-Log "Found $($projects.Count) Team Projects"
@@ -180,49 +562,57 @@ $allRepos        = [System.Collections.Generic.List[hashtable]]::new()
 $repoPipelineMap = @{}   # "ProjectName/RepoName" -> List[string] of pipeline names
 
 foreach ($project in $projects) {
-    $projName = $project.name
-    $repos    = Get-AllPages -BaseUrl "$baseUrl/$projName/_apis/git/repositories?api-version=7.1" -Headers $headers
+    $projName = [string]$project.name
+    $projSeg  = Get-ProjectSegment -ProjectName $projName
+
+    $repos = Get-AllPages -BaseUrl "$baseUrl/$projSeg/_apis/git/repositories?api-version=7.1" -Headers $headers
 
     foreach ($repo in $repos) {
-        $repoName = $repo.name
+        $repoName = [string]$repo.name
         $repoKey  = "$projName/$repoName"
-        $repoUrl  = $repo.remoteUrl
+        $repoUrl  = [string]$repo.remoteUrl
 
-        # Size (bytes) — ADO returns KB in repo.size
+        # ADO repository size is returned in KB
         $sizeBytes = 0
-        if ($repo.PSObject.Properties['size'] -and $repo.size) { $sizeBytes = $repo.size * 1KB }
+        if ($repo.PSObject.Properties['size'] -and $repo.size) {
+            $sizeBytes = [int64]$repo.size * 1KB
+        }
 
         # Last push date
-        $lastPush   = ""
-        $pushesList = Invoke-AdoApi -Url "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/pushes?api-version=7.1&`$top=1" -Headers $headers
+        $lastPush = ""
+        $repoIdEsc = [Uri]::EscapeDataString([string]$repo.id)
+        $pushesList = Invoke-AdoApi -Url "$baseUrl/$projSeg/_apis/git/repositories/$repoIdEsc/pushes?api-version=7.1&`$top=1" -Headers $headers
         if ($pushesList -and $pushesList.PSObject.Properties['value']) {
-            $pushValues = @($pushesList.value)
-            if ($pushValues.Count -gt 0 -and $pushValues[0].PSObject.Properties['date']) {
+            $pushValues = @(ConvertTo-ObjectArray $pushesList.value)
+            if ($pushValues.Count -gt 0 -and $pushValues[0] -and $pushValues[0].PSObject.Properties['date']) {
                 $lastPush = [string]$pushValues[0].date
             }
         }
 
-        # PR count — paginate to get the accurate total (response.count is only page count)
-        $prAll   = @(Get-AllPages -BaseUrl "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/pullrequests?api-version=7.1&searchCriteria.status=all" -Headers $headers)
-        $prCount = $prAll.Count
+        # Accurate PR count
+        $prAll = @(
+            Get-AllPages `
+                -BaseUrl "$baseUrl/$projSeg/_apis/git/repositories/$([Uri]::EscapeDataString([string]$repo.id))/pullrequests?api-version=7.1&searchCriteria.status=all" `
+                -Headers $headers
+        )
+        $prCount = @($prAll | Where-Object { $null -ne $_ }).Count
 
-        # Commits in the past year — used for both commits-past-year and most-active-contributor
-        $yearAgo     = (Get-Date).AddYears(-1).ToString("yyyy-MM-dd")
-        $yearCommits = @(Get-AllPages -BaseUrl "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/commits?api-version=7.1&searchCriteria.fromDate=$yearAgo" -Headers $headers)
-        $commitsPastYear = $yearCommits.Count
+        # Accurate commits in past year + most active contributor
+        $commitStats = Get-CommitStatsPastYear `
+            -BaseUrl $baseUrl `
+            -ProjectSegment $projSeg `
+            -RepoId ([string]$repo.id) `
+            -Headers $headers
 
-        $topContributor = ""
-        if ($yearCommits.Count -gt 0) {
-            $top1 = $yearCommits |
-                Where-Object  { $_.PSObject.Properties['author'] -and $_.author.PSObject.Properties['name'] } |
-                Group-Object  { [string]$_.author.name } |
-                Sort-Object   Count -Descending |
-                Select-Object -First 1
-            if ($top1) { $topContributor = $top1.Name }
+        $commitsPastYear = [int]$commitStats.Count
+        $topContributor  = [string]$commitStats.TopContributor
+
+        $normalizedId = if ($repo.PSObject.Properties['id'] -and $repo.id) {
+            ([string]$repo.id).ToLower()
         }
-
-        # Normalize GUID to lowercase for reliable cross-API matching in step 3
-        $normalizedId = if ($repo.PSObject.Properties['id'] -and $repo.id) { $repo.id.ToLower() } else { "" }
+        else {
+            ""
+        }
 
         $repoPipelineMap[$repoKey] = [System.Collections.Generic.List[string]]::new()
 
@@ -235,7 +625,7 @@ foreach ($project in $projects) {
             repo        = $repoName
             url         = $repoUrl
             "last-push-date"                = $lastPush
-            "pipeline-count"                = 0       # back-filled in step 4
+            "pipeline-count"                = 0
             "compressed-repo-size-in-bytes" = $sizeBytes
             "most-active-contributor"       = $topContributor
             "pr-count"                      = $prCount
@@ -246,9 +636,10 @@ foreach ($project in $projects) {
 
 Write-Log "Found $($allRepos.Count) Repos"
 
-# Build lookup maps with lowercase IDs for reliable matching against build definitions
+# Build lookup maps with lowercase IDs for reliable matching
 $repoIdToProject = @{}
 $repoIdToName    = @{}
+
 foreach ($r in $allRepos) {
     $rid = $r["_repoId"]
     if ($rid) {
@@ -266,85 +657,38 @@ Write-Log "Finding Pipelines..."
 $allPipelines = [System.Collections.Generic.List[hashtable]]::new()
 
 foreach ($project in $projects) {
-    $projName = $project.name
-    $defs     = Get-AllPages -BaseUrl "$baseUrl/$projName/_apis/build/definitions?api-version=7.1&queryOrder=definitionNameAscending" -Headers $headers
+    $projName = [string]$project.name
+    $projSeg  = Get-ProjectSegment -ProjectName $projName
+
+    $defs = Get-AllPages -BaseUrl "$baseUrl/$projSeg/_apis/build/definitions?api-version=7.1&queryOrder=definitionNameAscending" -Headers $headers
 
     foreach ($def in $defs) {
-        $pipelineName = $def.name
-        $pipelineId   = $def.id
-        $pipelineUrl  = "$baseUrl/$projName/_build/definition?definitionId=$pipelineId"
+        $pipelineName = [string]$def.name
+        $pipelineId   = [string]$def.id
+        $pipelineUrl  = "$baseUrl/$projSeg/_build/definition?definitionId=$pipelineId"
 
-        $repoProject = $projName
-        $repoName    = ""
-        $repoType    = ""
+        $resolved = Resolve-BuildRepository `
+            -PipelineProject $projName `
+            -Definition $def `
+            -BaseUrl $baseUrl `
+            -Headers $headers `
+            -RepoIdToProject $repoIdToProject `
+            -RepoIdToName $repoIdToName `
+            -AllRepos @($allRepos)
 
-        $repoInfo = if ($def.PSObject.Properties['repository']) { $def.repository } else { $null }
-        if ($repoInfo) {
-            $repoType    = if ($repoInfo.PSObject.Properties['type']) { [string]$repoInfo.type } else { "" }
-            $defRepoName = if ($repoInfo.PSObject.Properties['name']) { [string]$repoInfo.name } else { "" }
-            # Normalize GUID case — the build definitions API and repos API can differ
-            $defRepoId   = if ($repoInfo.PSObject.Properties['id'] -and $repoInfo.id) { $repoInfo.id.ToLower() } else { "" }
+        $repoProject      = $resolved.RepoProject
+        $repoName         = $resolved.RepoName
+        $crossProjectRepo = $resolved.CrossProjectRepo
+        $repoType         = $resolved.RepoType
 
-            if ($repoType -eq "TfsGit") {
-                $resolved = $false
-
-                # Resolution 1: exact ID match (fast — no extra API call)
-                if ($defRepoId -and $repoIdToProject.ContainsKey($defRepoId)) {
-                    $repoProject = $repoIdToProject[$defRepoId]
-                    $repoName    = $repoIdToName[$defRepoId]
-                    $resolved    = $true
-                }
-
-                # Resolution 2: name match within the pipeline's own project
-                # Handles the case where repository.id is absent from the abbreviated response
-                if (-not $resolved -and $defRepoName -and $repoPipelineMap.ContainsKey("$projName/$defRepoName")) {
-                    $repoProject = $projName
-                    $repoName    = $defRepoName
-                    $resolved    = $true
-                }
-
-                if (-not $resolved) {
-                    # Resolution 3: fetch full definition for cross-project cases
-                    $fullDef = Invoke-AdoApi -Url "$baseUrl/$projName/_apis/build/definitions/${pipelineId}?api-version=7.1" -Headers $headers
-                    if ($fullDef) {
-                        $fullRepo = if ($fullDef.PSObject.Properties['repository']) { $fullDef.repository } else { $null }
-                        $projProp = if ($fullRepo -and $fullRepo.PSObject.Properties['project']) { $fullRepo.project } else { $null }
-                        if ($projProp -and $projProp.PSObject.Properties['name']) {
-                            $repoProject = [string]$projProp.name
-                            $resolved    = $true
-                        }
-                        if ($fullRepo -and $fullRepo.PSObject.Properties['name']) {
-                            $fn = [string]$fullRepo.name
-                            # Strip "ProjectName/" prefix if present
-                            $repoName = if ($fn -match '^[^/]+/(.+)$') { $Matches[1] } else { $fn }
-                        }
-                    }
-
-                    # Resolution 4: name match across all projects (last resort)
-                    if (-not $resolved -and $defRepoName) {
-                        $xMatch = $allRepos | Where-Object { $_["repo"] -eq $defRepoName } | Select-Object -First 1
-                        if ($xMatch) {
-                            $repoProject = $xMatch["_projName"]
-                            $repoName    = $defRepoName
-                        } else {
-                            $repoName = $defRepoName
-                        }
-                    }
-                }
-            } else {
-                # Non-TfsGit (GitHub, external Git, etc.) — keep as-is
-                $repoName = $defRepoName
-            }
-        }
-
-        $repoKey = "$repoProject/$repoName"
-        if ($repoPipelineMap.ContainsKey($repoKey)) {
+        $repoKey = if ($repoProject -and $repoName) { "$repoProject/$repoName" } else { "" }
+        if ($repoKey -and $repoPipelineMap.ContainsKey($repoKey)) {
             $repoPipelineMap[$repoKey].Add($pipelineName)
         }
 
-        # cross-project-repo: blank for same-project, "ProjectName/RepoName" for cross-project
-        $isCrossProject   = ($repoType -eq "TfsGit") -and ($repoProject -ne $projName)
-        $crossProjectRepo = if ($isCrossProject) { "$repoProject/$repoName" } else { "" }
+        if ($repoType -eq "TfsGit" -and [string]::IsNullOrWhiteSpace($repoName)) {
+            Write-Warning "Could not resolve repository name for pipeline '$pipelineName' in project '$projName'."
+        }
 
         $allPipelines.Add(@{
             org                  = $AdoOrg
@@ -394,23 +738,25 @@ Write-Csv `
 Write-Log "orgs.csv generated" -Success
 
 # -- team-projects.csv --
-$teamProjectRows = @(foreach ($project in $projects) {
-    $projName  = $project.name
-    $projRepos = @($allRepos     | Where-Object { $_["_projName"]  -eq $projName })
-    $projPipes = @($allPipelines | Where-Object { $_["teamproject"] -eq $projName })
-    $projPRs   = ($projRepos | ForEach-Object { [int]$_["pr-count"] } | Measure-Object -Sum).Sum
+$teamProjectRows = @(
+    foreach ($project in $projects) {
+        $projName  = [string]$project.name
+        $projRepos = @($allRepos     | Where-Object { $_["_projName"]   -eq $projName })
+        $projPipes = @($allPipelines | Where-Object { $_["teamproject"] -eq $projName })
+        $projPRs   = ($projRepos | ForEach-Object { [int]$_["pr-count"] } | Measure-Object -Sum).Sum
 
-    @{
-        "org"            = $AdoOrg
-        "teamproject"    = $projName
-        "url"            = "$baseUrl/$projName"
-        "repo-count"     = $projRepos.Count
-        "pipeline-count" = $projPipes.Count
-        "pr-count"       = $projPRs
+        @{
+            "org"            = $AdoOrg
+            "teamproject"    = $projName
+            "url"            = "$baseUrl/$(Get-ProjectSegment -ProjectName $projName)"
+            "repo-count"     = $projRepos.Count
+            "pipeline-count" = $projPipes.Count
+            "pr-count"       = $projPRs
+        }
     }
-})
+)
 
-Write-Log "Generating teamprojects.csv..."
+Write-Log "Generating team-projects.csv..."
 Write-Csv `
     -Path    (Join-Path $OutputDir "team-projects.csv") `
     -Headers @("org","teamproject","url","repo-count","pipeline-count","pr-count") `
@@ -418,20 +764,22 @@ Write-Csv `
 Write-Log "team-projects.csv generated" -Success
 
 # -- repos.csv --
-$repoRows = @($allRepos | ForEach-Object {
-    @{
-        "org"                           = $_["org"]
-        "teamproject"                   = $_["teamproject"]
-        "repo"                          = $_["repo"]
-        "url"                           = $_["url"]
-        "last-push-date"                = $_["last-push-date"]
-        "pipeline-count"                = $_["pipeline-count"]
-        "compressed-repo-size-in-bytes" = $_["compressed-repo-size-in-bytes"]
-        "most-active-contributor"       = $_["most-active-contributor"]
-        "pr-count"                      = $_["pr-count"]
-        "commits-past-year"             = $_["commits-past-year"]
+$repoRows = @(
+    $allRepos | ForEach-Object {
+        @{
+            "org"                           = $_["org"]
+            "teamproject"                   = $_["teamproject"]
+            "repo"                          = $_["repo"]
+            "url"                           = $_["url"]
+            "last-push-date"                = $_["last-push-date"]
+            "pipeline-count"                = $_["pipeline-count"]
+            "compressed-repo-size-in-bytes" = $_["compressed-repo-size-in-bytes"]
+            "most-active-contributor"       = $_["most-active-contributor"]
+            "pr-count"                      = $_["pr-count"]
+            "commits-past-year"             = $_["commits-past-year"]
+        }
     }
-})
+)
 
 Write-Log "Generating repos.csv..."
 Write-Csv `
@@ -441,9 +789,6 @@ Write-Csv `
 Write-Log "repos.csv generated" -Success
 
 # -- pipelines.csv --
-# Matches ado2gh column order: org, teamproject, repo, pipeline, url
-# Plus one extension column: cross-project-repo (blank when repo lives in the
-# same project as the pipeline; "ProjectName/RepoName" when it does not)
 Write-Log "Generating pipelines.csv..."
 Write-Csv `
     -Path    (Join-Path $OutputDir "pipelines.csv") `
