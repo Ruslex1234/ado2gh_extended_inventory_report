@@ -89,7 +89,7 @@ function Get-AllPages {
         $response = Invoke-AdoApi -Url $url -Headers $Headers
         if ($null -eq $response) { break }
 
-        $page = $response.$ValueProperty
+        $page = if ($response.PSObject.Properties[$ValueProperty]) { $response.$ValueProperty } else { $null }
         if ($null -eq $page -or $page.Count -eq 0) { break }
 
         $results.AddRange([object[]]$page)
@@ -180,11 +180,9 @@ foreach ($project in $projects) {
         $repoKey  = "$projName/$repoName"
         $repoUrl  = $repo.remoteUrl
 
-        # Size (bytes) - from repo stats endpoint
+        # Size (bytes) — ADO returns KB in repo.size
         $sizeBytes = 0
-        $statsResp = Invoke-AdoApi -Url "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/stats?api-version=7.1" -Headers $headers
-        # Size is not directly in stats; use repo.size if available
-        if ($repo.size) { $sizeBytes = $repo.size * 1KB }   # ADO returns KB
+        if ($repo.PSObject.Properties['size'] -and $repo.size) { $sizeBytes = $repo.size * 1KB }
 
         # Last push date
         $lastPush = ""
@@ -198,10 +196,7 @@ foreach ($project in $projects) {
         $prResp = Invoke-AdoApi -Url "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/pullrequests?api-version=7.1&searchCriteria.status=all&`$top=1" -Headers $headers
         if ($prResp -and $prResp.count) { $prCount = $prResp.count }
 
-        # Most active contributor (top committer by author name in stats)
-        $topContributor = ""
-        $contribResp = Invoke-AdoApi -Url "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/stats/branches?api-version=7.1" -Headers $headers
-        # Commits past year via pushes count heuristic - skip for now, use 0
+        $topContributor  = ""
         $commitsPastYear = 0
 
         $repoPipelineMap[$repoKey]  = [System.Collections.Generic.List[string]]::new()
@@ -229,6 +224,18 @@ foreach ($project in $projects) {
 
 Write-Host "      Found $($allRepos.Count) repo(s) across all projects"
 
+# Build repo-ID -> project/name maps so step 3 can resolve cross-project refs
+# from the abbreviated pipeline list response — no extra per-pipeline API calls needed.
+$repoIdToProject = @{}
+$repoIdToName    = @{}
+foreach ($r in $allRepos) {
+    $rid = $r["_repoId"]
+    if ($rid) {
+        $repoIdToProject[$rid] = $r["_projName"]
+        $repoIdToName[$rid]    = $r["repo"]
+    }
+}
+
 # ---------------------------------------------------------------------------
 # 3. Fetch ALL pipelines from ALL projects
 #    KEY DIFFERENCE vs ado2gh: we resolve the ACTUAL repo the pipeline points
@@ -250,51 +257,60 @@ foreach ($project in $projects) {
         $pipelineId   = $def.id
         $pipelineUrl  = "$baseUrl/$projName/_build/definition?definitionId=$pipelineId"
 
-        # Fetch full definition to get repository details
-        $fullDef = Invoke-AdoApi -Url "$baseUrl/$projName/_apis/build/definitions/${pipelineId}?api-version=7.1" -Headers $headers
-        if ($null -eq $fullDef) { continue }
-
-        # Resolve the repo this pipeline actually points to
-        $repoProject = $projName   # default: same project
+        $repoProject = $projName
         $repoName    = ""
         $repoType    = ""
 
-        if ($fullDef.repository) {
-            $repoType = $fullDef.repository.type
-            $repoName = $fullDef.repository.name
+        $repoInfo = if ($def.PSObject.Properties['repository']) { $def.repository } else { $null }
+        if ($repoInfo) {
+            $repoType = if ($repoInfo.PSObject.Properties['type']) { [string]$repoInfo.type } else { "" }
+            $repoName = if ($repoInfo.PSObject.Properties['name']) { [string]$repoInfo.name } else { "" }
+            $repoId   = if ($repoInfo.PSObject.Properties['id'])   { [string]$repoInfo.id }   else { "" }
 
-            # For TfsGit (Azure Repos Git), the repository.project.name tells us
-            # the ACTUAL project, which may differ from the pipeline's project
-            if ($repoType -eq "TfsGit" -and $fullDef.repository.project) {
-                $repoProject = $fullDef.repository.project.name
+            if ($repoType -eq "TfsGit") {
+                if ($repoId -and $repoIdToProject.ContainsKey($repoId)) {
+                    # Fast path: the abbreviated list response already has the repo ID;
+                    # resolve project/name from our map without an extra API call.
+                    $repoProject = $repoIdToProject[$repoId]
+                    $repoName    = $repoIdToName[$repoId]
+                } else {
+                    # Slow path: repo not in our map (deleted, inaccessible project, etc.).
+                    # Fetch full definition and guard every property access against strict mode.
+                    $fullDef = Invoke-AdoApi -Url "$baseUrl/$projName/_apis/build/definitions/${pipelineId}?api-version=7.1" -Headers $headers
+                    if ($fullDef) {
+                        $fullRepo = if ($fullDef.PSObject.Properties['repository']) { $fullDef.repository } else { $null }
+                        $projProp = if ($fullRepo -and $fullRepo.PSObject.Properties['project']) { $fullRepo.project } else { $null }
+                        if ($projProp -and $projProp.PSObject.Properties['name']) {
+                            $repoProject = [string]$projProp.name
+                        }
+                    }
+                    # If the full fetch also fails, the pipeline still gets recorded
+                    # with repoProject = $projName (same-project assumption).
+                }
             }
-            # Handle "ProjectName/RepoName" format
-            elseif ($repoName -match "^(.+)/(.+)$") {
-                $repoProject = $Matches[1]
-                $repoName    = $Matches[2]
-            }
+            # Non-TfsGit sources (GitHub, external Git, etc.): repoProject stays as
+            # $projName so is-cross-project is never misleadingly set for external repos.
         }
 
         $repoKey = "$repoProject/$repoName"
 
-        # Attribute this pipeline to the repo it ACTUALLY uses
         if ($repoPipelineMap.ContainsKey($repoKey)) {
             $repoPipelineMap[$repoKey].Add($pipelineName)
         }
 
-        # Flag cross-project reference
-        $isCrossProject = ($repoProject -ne $projName)
+        # Cross-project is only meaningful for Azure Repos (TfsGit)
+        $isCrossProject = ($repoType -eq "TfsGit") -and ($repoProject -ne $projName)
 
         $allPipelines.Add(@{
-            org                          = $AdoOrg
-            "pipeline-project"           = $projName
-            "pipeline-name"              = $pipelineName
-            "pipeline-id"                = $pipelineId
-            "pipeline-url"               = $pipelineUrl
-            "repo-project"               = $repoProject
-            "repo-name"                  = $repoName
-            "repo-type"                  = $repoType
-            "is-cross-project"           = $isCrossProject.ToString().ToLower()
+            org                = $AdoOrg
+            "pipeline-project" = $projName
+            "pipeline-name"    = $pipelineName
+            "pipeline-id"      = $pipelineId
+            "pipeline-url"     = $pipelineUrl
+            "repo-project"     = $repoProject
+            "repo-name"        = $repoName
+            "repo-type"        = $repoType
+            "is-cross-project" = $isCrossProject.ToString().ToLower()
         })
     }
 }
