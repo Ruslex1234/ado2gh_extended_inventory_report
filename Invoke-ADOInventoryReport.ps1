@@ -48,6 +48,19 @@ $ErrorActionPreference = "Stop"
 # Helpers
 # ---------------------------------------------------------------------------
 
+function Write-Log {
+    param(
+        [string]$Message,
+        [switch]$Success
+    )
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    if ($Success) {
+        Write-Host "[$ts] [INFO] $Message" -ForegroundColor Green
+    } else {
+        Write-Host "[$ts] [INFO] $Message"
+    }
+}
+
 function Get-AuthHeader {
     $token = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$AdoPat"))
     return @{ Authorization = "Basic $token"; "Content-Type" = "application/json" }
@@ -69,10 +82,6 @@ function Invoke-AdoApi {
 }
 
 function Get-AllPages {
-    <#
-        ADO list APIs are capped at 100 items per call.
-        This fetches all pages using continuationToken or $top/$skip.
-    #>
     param (
         [string]$BaseUrl,
         [hashtable]$Headers = (Get-AuthHeader),
@@ -89,10 +98,12 @@ function Get-AllPages {
         $response = Invoke-AdoApi -Url $url -Headers $Headers
         if ($null -eq $response) { break }
 
-        $page = if ($response.PSObject.Properties[$ValueProperty]) { $response.$ValueProperty } else { $null }
-        if ($null -eq $page -or $page.Count -eq 0) { break }
+        # Wrap in @() so .Count is always valid in strict mode even for single-item responses
+        $pageRaw = if ($response.PSObject.Properties[$ValueProperty]) { $response.$ValueProperty } else { $null }
+        $page    = @($pageRaw)
+        if ($page.Count -eq 0) { break }
 
-        $results.AddRange([object[]]$page)
+        $results.AddRange($page)
         $skip += $page.Count
 
         if ($page.Count -lt $top) { break }
@@ -126,7 +137,6 @@ function Write-Csv {
         $lines.Add($cells -join ",")
     }
     $lines | Set-Content -Path $Path -Encoding UTF8
-    Write-Host "  Written: $Path ($($Rows.Count) rows)"
 }
 
 # ---------------------------------------------------------------------------
@@ -142,38 +152,36 @@ if (-not $OutputDir) {
     $OutputDir = (New-Item -ItemType Directory -Path $OutputDir -Force).FullName
 }
 
-$baseUrl  = "https://dev.azure.com/$AdoOrg"
-$headers  = Get-AuthHeader
+$baseUrl = "https://dev.azure.com/$AdoOrg"
+$headers = Get-AuthHeader
 
-Write-Host "`nADO Inventory Report - Org: $AdoOrg"
-Write-Host "Output directory: $OutputDir`n"
+Write-Log "ADO ORG: $AdoOrg"
+Write-Log "Creating inventory report..."
 
 # ---------------------------------------------------------------------------
 # 1. Fetch all team projects
 # ---------------------------------------------------------------------------
 
-Write-Host "[1/5] Fetching team projects..."
+Write-Log "Finding Orgs..."
 $projectsResponse = Invoke-AdoApi -Url "$baseUrl/_apis/projects?api-version=7.1&`$top=500" -Headers $headers
-$projects = $projectsResponse.value
-Write-Host "      Found $($projects.Count) project(s)"
+if ($null -eq $projectsResponse) { throw "Failed to fetch projects from $baseUrl" }
+$projects = @($projectsResponse.value)
+Write-Log "Found 1 Orgs"
+Write-Log "Finding Team Projects..."
+Write-Log "Found $($projects.Count) Team Projects"
 
 # ---------------------------------------------------------------------------
 # 2. Fetch repos per project + stats
 # ---------------------------------------------------------------------------
 
-Write-Host "[2/5] Fetching repositories..."
+Write-Log "Finding Repos..."
 
-$allRepos = [System.Collections.Generic.List[hashtable]]::new()
-
-# repoKey -> list of pipeline names (populated in step 3)
-$repoPipelineMap  = @{}   # "ProjectName/RepoName" -> [List of pipeline display names]
-$repoLastPushMap  = @{}   # "ProjectName/RepoName" -> last push date string
-$repoPrCountMap   = @{}   # "ProjectName/RepoName" -> pr count
-$repoSizeMap      = @{}   # "ProjectName/RepoName" -> size in bytes
+$allRepos        = [System.Collections.Generic.List[hashtable]]::new()
+$repoPipelineMap = @{}   # "ProjectName/RepoName" -> List[string] of pipeline names
 
 foreach ($project in $projects) {
     $projName = $project.name
-    $repos = Get-AllPages -BaseUrl "$baseUrl/$projName/_apis/git/repositories?api-version=7.1" -Headers $headers
+    $repos    = Get-AllPages -BaseUrl "$baseUrl/$projName/_apis/git/repositories?api-version=7.1" -Headers $headers
 
     foreach ($repo in $repos) {
         $repoName = $repo.name
@@ -185,24 +193,21 @@ foreach ($project in $projects) {
         if ($repo.PSObject.Properties['size'] -and $repo.size) { $sizeBytes = $repo.size * 1KB }
 
         # Last push date
-        $lastPush = ""
+        $lastPush   = ""
         $pushesList = Invoke-AdoApi -Url "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/pushes?api-version=7.1&`$top=1" -Headers $headers
-        if ($pushesList -and $pushesList.value -and $pushesList.value.Count -gt 0) {
-            $lastPush = $pushesList.value[0].date
+        if ($pushesList -and $pushesList.PSObject.Properties['value']) {
+            $pushValues = @($pushesList.value)
+            if ($pushValues.Count -gt 0 -and $pushValues[0].PSObject.Properties['date']) {
+                $lastPush = [string]$pushValues[0].date
+            }
         }
 
-        # PR count (completed + active)
+        # PR count (all statuses)
         $prCount = 0
-        $prResp = Invoke-AdoApi -Url "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/pullrequests?api-version=7.1&searchCriteria.status=all&`$top=1" -Headers $headers
-        if ($prResp -and $prResp.count) { $prCount = $prResp.count }
+        $prResp  = Invoke-AdoApi -Url "$baseUrl/$projName/_apis/git/repositories/$($repo.id)/pullrequests?api-version=7.1&searchCriteria.status=all&`$top=1" -Headers $headers
+        if ($prResp -and $prResp.PSObject.Properties['count']) { $prCount = [int]$prResp.count }
 
-        $topContributor  = ""
-        $commitsPastYear = 0
-
-        $repoPipelineMap[$repoKey]  = [System.Collections.Generic.List[string]]::new()
-        $repoLastPushMap[$repoKey]  = $lastPush
-        $repoPrCountMap[$repoKey]   = $prCount
-        $repoSizeMap[$repoKey]      = $sizeBytes
+        $repoPipelineMap[$repoKey] = [System.Collections.Generic.List[string]]::new()
 
         $allRepos.Add(@{
             _projName   = $projName
@@ -212,17 +217,17 @@ foreach ($project in $projects) {
             teamproject = $projName
             repo        = $repoName
             url         = $repoUrl
-            "last-push-date"                  = $lastPush
-            "pipeline-count"                  = 0    # filled in step 3
-            "compressed-repo-size-in-bytes"   = $sizeBytes
-            "most-active-contributor"         = $topContributor
-            "pr-count"                        = $prCount
-            "commits-past-year"               = $commitsPastYear
+            "last-push-date"                = $lastPush
+            "pipeline-count"                = 0    # filled in step 3
+            "compressed-repo-size-in-bytes" = $sizeBytes
+            "most-active-contributor"       = ""
+            "pr-count"                      = $prCount
+            "commits-past-year"             = 0
         })
     }
 }
 
-Write-Host "      Found $($allRepos.Count) repo(s) across all projects"
+Write-Log "Found $($allRepos.Count) Repos"
 
 # Build repo-ID -> project/name maps so step 3 can resolve cross-project refs
 # from the abbreviated pipeline list response — no extra per-pipeline API calls needed.
@@ -242,14 +247,13 @@ foreach ($r in $allRepos) {
 #    to (which may live in a DIFFERENT project) and attribute it correctly.
 # ---------------------------------------------------------------------------
 
-Write-Host "[3/5] Fetching pipelines (with cross-project repo resolution)..."
+Write-Log "Finding Pipelines..."
 
 $allPipelines = [System.Collections.Generic.List[hashtable]]::new()
 
 foreach ($project in $projects) {
     $projName = $project.name
 
-    # Fetch pipeline definitions (build definitions)
     $defs = Get-AllPages -BaseUrl "$baseUrl/$projName/_apis/build/definitions?api-version=7.1&queryOrder=definitionNameAscending" -Headers $headers
 
     foreach ($def in $defs) {
@@ -269,13 +273,12 @@ foreach ($project in $projects) {
 
             if ($repoType -eq "TfsGit") {
                 if ($repoId -and $repoIdToProject.ContainsKey($repoId)) {
-                    # Fast path: the abbreviated list response already has the repo ID;
-                    # resolve project/name from our map without an extra API call.
+                    # Fast path: resolve from our already-fetched repo map (no extra API call)
                     $repoProject = $repoIdToProject[$repoId]
                     $repoName    = $repoIdToName[$repoId]
                 } else {
-                    # Slow path: repo not in our map (deleted, inaccessible project, etc.).
-                    # Fetch full definition and guard every property access against strict mode.
+                    # Slow path: repo not in our map (deleted, inaccessible project, etc.)
+                    # Fetch full definition with strict-mode-safe property guards
                     $fullDef = Invoke-AdoApi -Url "$baseUrl/$projName/_apis/build/definitions/${pipelineId}?api-version=7.1" -Headers $headers
                     if ($fullDef) {
                         $fullRepo = if ($fullDef.PSObject.Properties['repository']) { $fullDef.repository } else { $null }
@@ -284,7 +287,7 @@ foreach ($project in $projects) {
                             $repoProject = [string]$projProp.name
                         }
                     }
-                    # If the full fetch also fails, the pipeline still gets recorded
+                    # If the full fetch also fails, the pipeline is still recorded
                     # with repoProject = $projName (same-project assumption).
                 }
             }
@@ -293,7 +296,6 @@ foreach ($project in $projects) {
         }
 
         $repoKey = "$repoProject/$repoName"
-
         if ($repoPipelineMap.ContainsKey($repoKey)) {
             $repoPipelineMap[$repoKey].Add($pipelineName)
         }
@@ -315,13 +317,11 @@ foreach ($project in $projects) {
     }
 }
 
-Write-Host "      Found $($allPipelines.Count) pipeline(s) across all projects"
+Write-Log "Found $($allPipelines.Count) Pipelines"
 
 # ---------------------------------------------------------------------------
-# 4. Back-fill pipeline-count into repos rows
+# 4. Back-fill pipeline-count into repo rows
 # ---------------------------------------------------------------------------
-
-Write-Host "[4/5] Calculating per-repo pipeline counts..."
 
 foreach ($repo in $allRepos) {
     $key = $repo["_repoKey"]
@@ -331,39 +331,34 @@ foreach ($repo in $allRepos) {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Build summary rows and write CSVs
+# 5. Write CSVs
 # ---------------------------------------------------------------------------
 
-Write-Host "[5/5] Writing CSV files...`n"
-
 # -- orgs.csv --
-$totalRepos     = $allRepos.Count
-$totalPipelines = $allPipelines.Count
-$totalProjects  = $projects.Count
-$totalPRs       = ($allRepos | ForEach-Object { [int]$_["pr-count"] } | Measure-Object -Sum).Sum
-
 $orgRow = @{
-    "name"               = $AdoOrg
-    "url"                = "https://dev.azure.com/$AdoOrg"
-    "owner"              = $AdoOrg
-    "teamproject-count"  = $totalProjects
-    "repo-count"         = $totalRepos
-    "pipeline-count"     = $totalPipelines
-    "is-pat-org-admin"   = "unknown"
-    "pr-count"           = $totalPRs
+    "name"              = $AdoOrg
+    "url"               = "https://dev.azure.com/$AdoOrg"
+    "owner"             = $AdoOrg
+    "teamproject-count" = $projects.Count
+    "repo-count"        = $allRepos.Count
+    "pipeline-count"    = $allPipelines.Count
+    "is-pat-org-admin"  = "unknown"
+    "pr-count"          = ($allRepos | ForEach-Object { [int]$_["pr-count"] } | Measure-Object -Sum).Sum
 }
 
+Write-Log "Generating orgs.csv..."
 Write-Csv `
-    -Path (Join-Path $OutputDir "orgs.csv") `
+    -Path    (Join-Path $OutputDir "orgs.csv") `
     -Headers @("name","url","owner","teamproject-count","repo-count","pipeline-count","is-pat-org-admin","pr-count") `
-    -Rows @($orgRow)
+    -Rows    @($orgRow)
+Write-Log "orgs.csv generated" -Success
 
 # -- team-projects.csv --
-$teamProjectRows = foreach ($project in $projects) {
-    $projName    = $project.name
-    $projRepos   = $allRepos | Where-Object { $_["_projName"] -eq $projName }
-    $projPipes   = $allPipelines | Where-Object { $_["pipeline-project"] -eq $projName }
-    $projPRs     = ($projRepos | ForEach-Object { [int]$_["pr-count"] } | Measure-Object -Sum).Sum
+$teamProjectRows = @(foreach ($project in $projects) {
+    $projName  = $project.name
+    $projRepos = @($allRepos     | Where-Object { $_["_projName"]       -eq $projName })
+    $projPipes = @($allPipelines | Where-Object { $_["pipeline-project"] -eq $projName })
+    $projPRs   = ($projRepos | ForEach-Object { [int]$_["pr-count"] } | Measure-Object -Sum).Sum
 
     @{
         "org"            = $AdoOrg
@@ -373,42 +368,44 @@ $teamProjectRows = foreach ($project in $projects) {
         "pipeline-count" = $projPipes.Count
         "pr-count"       = $projPRs
     }
-}
+})
 
+Write-Log "Generating teamprojects.csv..."
 Write-Csv `
-    -Path (Join-Path $OutputDir "team-projects.csv") `
+    -Path    (Join-Path $OutputDir "team-projects.csv") `
     -Headers @("org","teamproject","url","repo-count","pipeline-count","pr-count") `
-    -Rows $teamProjectRows
+    -Rows    $teamProjectRows
+Write-Log "team-projects.csv generated" -Success
 
 # -- repos.csv --
-$repoRows = $allRepos | ForEach-Object {
+$repoRows = @($allRepos | ForEach-Object {
     @{
-        "org"                             = $_["org"]
-        "teamproject"                     = $_["teamproject"]
-        "repo"                            = $_["repo"]
-        "url"                             = $_["url"]
-        "last-push-date"                  = $_["last-push-date"]
-        "pipeline-count"                  = $_["pipeline-count"]
-        "compressed-repo-size-in-bytes"   = $_["compressed-repo-size-in-bytes"]
-        "most-active-contributor"         = $_["most-active-contributor"]
-        "pr-count"                        = $_["pr-count"]
-        "commits-past-year"               = $_["commits-past-year"]
+        "org"                           = $_["org"]
+        "teamproject"                   = $_["teamproject"]
+        "repo"                          = $_["repo"]
+        "url"                           = $_["url"]
+        "last-push-date"                = $_["last-push-date"]
+        "pipeline-count"                = $_["pipeline-count"]
+        "compressed-repo-size-in-bytes" = $_["compressed-repo-size-in-bytes"]
+        "most-active-contributor"       = $_["most-active-contributor"]
+        "pr-count"                      = $_["pr-count"]
+        "commits-past-year"             = $_["commits-past-year"]
     }
-}
+})
 
+Write-Log "Generating repos.csv..."
 Write-Csv `
-    -Path (Join-Path $OutputDir "repos.csv") `
+    -Path    (Join-Path $OutputDir "repos.csv") `
     -Headers @("org","teamproject","repo","url","last-push-date","pipeline-count","compressed-repo-size-in-bytes","most-active-contributor","pr-count","commits-past-year") `
-    -Rows $repoRows
+    -Rows    $repoRows
+Write-Log "repos.csv generated" -Success
 
 # -- pipelines.csv --
-# Includes a bonus "is-cross-project" column not in the original ado2gh output
+# Includes "is-cross-project" column not in the original ado2gh output
 # so you can immediately see which pipelines were previously invisible
+Write-Log "Generating pipelines.csv..."
 Write-Csv `
-    -Path (Join-Path $OutputDir "pipelines.csv") `
+    -Path    (Join-Path $OutputDir "pipelines.csv") `
     -Headers @("org","pipeline-project","pipeline-name","pipeline-id","pipeline-url","repo-project","repo-name","repo-type","is-cross-project") `
-    -Rows $allPipelines
-
-Write-Host "`nDone. Files written to: $OutputDir"
-Write-Host "  orgs.csv, team-projects.csv, repos.csv, pipelines.csv"
-Write-Host "`nCross-project pipelines found: $(($allPipelines | Where-Object { $_['is-cross-project'] -eq 'true' }).Count)"
+    -Rows    @($allPipelines)
+Write-Log "pipelines.csv generated" -Success
